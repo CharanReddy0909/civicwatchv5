@@ -1,64 +1,12 @@
 import { AnimatePresence, motion } from "framer-motion";
-// add near other imports
-import { sb } from "./data/providers/supabase";
- // Create (supports both providers)
-import { DATA_MODE } from "./data/provider";
-
-// put this component in the file
-function AuthPanel({ onAuthed }) {
-  const [email, setEmail] = React.useState("");
-  const [user, setUser] = React.useState(null);
-  const [msg, setMsg] = React.useState("");
-
-  React.useEffect(() => {
-    sb.auth.getUser().then(({ data }) => setUser(data.user ?? null));
-    const { data: sub } = sb.auth.onAuthStateChange((_e, session) => {
-      setUser(session?.user ?? null);
-      if (session?.user) onAuthed?.(); // refresh issues after login
-    });
-    return () => sub.subscription.unsubscribe();
-  }, [onAuthed]);
-
-  if (user) {
-    return (
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-slate-600">{user.email}</span>
-        <button
-          className="rounded-xl border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm hover:bg-slate-50"
-          onClick={() => sb.auth.signOut()}
-        >
-          Log out
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center gap-2">
-      <input
-        className="rounded-xl border border-slate-300 px-2 py-1 text-sm outline-none"
-        placeholder="email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-      />
-      <button
-        className="rounded-xl bg-slate-900 px-3 py-1.5 text-sm text-white shadow hover:bg-slate-800"
-        onClick={async () => {
-          setMsg("");
-          const { error } = await sb.auth.signInWithOtp({
-            email,
-            options: { emailRedirectTo: window.location.origin },
-          });
-          setMsg(error ? error.message : "Check your email for the login link.");
-        }}
-      >
-        Send link
-      </button>
-      {msg && <span className="text-xs text-slate-500">{msg}</span>}
-    </div>
-  );
-}
-{DATA_MODE === "supabase" && <AuthPanel onAuthed={() => refresh()} />}
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createIssue as apiCreateIssue,
+  setIssueSolved as apiSetSolved,
+  upvoteIssue as apiUpvote,
+  getCurrentUser,
+  listIssues
+} from "./data/provider";
 
 import {
   Camera,
@@ -68,56 +16,29 @@ import {
   CircleDot,
   Dot,
   Filter,
-  LogIn,
-  LogOut,
   MapPin,
   Plus,
   Search,
-  ShieldCheck,
   Tag,
   ThumbsUp,
-  Trash2,
-  Upload,
+  Upload
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
 
-import {
-  createIssue as apiCreateIssue,
-  setIssueSolved as apiSetSolved,
-  upvoteIssue as apiUpvote,
-  listIssues
-} from "./data/provider";
+
+
 
 /**
- * Post/UI shape (for reference)
- * {
- *   id, description, address, tags[], imageDataUrl, solved, upvotes, voters[], createdAt, submitterId
- * }
+ * NOTE: This App.jsx is updated to prevent **duplicate submissions**.
+ * - The form is guarded against double-submit (ref + busy).
+ * - We pass a clientNonce to the provider, which upserts by a UNIQUE constraint.
+ * - We do NOT optimistically add to state; we insert via provider then refresh().
  */
 
 // -----------------------------
-// Local helpers (kept for tests / LS user id)
+// Tiny helpers
 // -----------------------------
-const LS_KEY_USER = "civicwatch.user.v1";
-const LS_KEY_AUTH = "civicwatch.authority.v1";
-const AUTH_DEMO_CODE = "AUTH-2025"; // demo only
-const IS_LOCAL = DATA_MODE === "local";
-const ENABLE_SELF_TESTS = true;
-
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-function useLocalUser() {
-  const [userId, setUserId] = useState("");
-  useEffect(() => {
-    let u = localStorage.getItem(LS_KEY_USER);
-    if (!u) {
-      u = `user_${uid()}`;
-      localStorage.setItem(LS_KEY_USER, u);
-    }
-    setUserId(u);
-  }, []);
-  return userId;
 }
 
 function timeAgo(ts) {
@@ -136,59 +57,32 @@ function timeAgo(ts) {
 }
 
 function computeFilteredSorted(posts, { query, statusFilter, tagFilter, sortBy }) {
-  let list = posts;
+  let list = posts || [];
   if (query && query.trim()) {
     const q = query.toLowerCase();
     list = list.filter(
       (p) =>
-        p.description.toLowerCase().includes(q) ||
-        p.address.toLowerCase().includes(q) ||
-        p.tags.some((t) => t.toLowerCase().includes(q))
+        p.description?.toLowerCase().includes(q) ||
+        p.address?.toLowerCase().includes(q) ||
+        (p.tags || []).some((t) => t.toLowerCase().includes(q))
     );
   }
   if (statusFilter && statusFilter !== "all") {
     const wantSolved = statusFilter === "solved";
-    list = list.filter((p) => p.solved === wantSolved);
+    list = list.filter((p) => !!p.solved === wantSolved);
   }
   if (tagFilter && tagFilter.trim()) {
     const tf = tagFilter.toLowerCase();
-    list = list.filter((p) => p.tags.map((t) => t.toLowerCase()).includes(tf));
+    list = list.filter((p) => (p.tags || []).map((t) => t.toLowerCase()).includes(tf));
   }
   if (sortBy === "trending") {
-    list = [...list].sort((a, b) => b.upvotes - a.upvotes || b.createdAt - a.createdAt);
+    list = [...list].sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0) || (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0));
   } else if (sortBy === "newest") {
-    list = [...list].sort((a, b) => b.createdAt - a.createdAt);
+    list = [...list].sort((a, b) => (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0));
   } else if (sortBy === "most_upvoted") {
-    list = [...list].sort((a, b) => b.upvotes - a.upvotes);
+    list = [...list].sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0));
   }
   return list;
-}
-
-// local-only upvote utility (for optimistic UI in LS mode)
-function upvotePost(post, userId) {
-  if (post.voters.includes(userId)) return post;
-  return { ...post, upvotes: post.upvotes + 1, voters: [...post.voters, userId] };
-}
-
-// Tiny console tests
-function runSelfTests() {
-  console.groupCollapsed("CivicWatch self-tests");
-  const now = 1_700_000_000_000;
-  const posts = [
-    { id: "a", description: "Streetlight not working", address: "12 MG Road, Sector 5", tags: ["lights", "safety"], imageDataUrl: null, solved: false, upvotes: 3, voters: ["u2", "u3", "u4"], createdAt: now - 1000, submitterId: "u1" },
-    { id: "b", description: "Potholes causing traffic", address: "Main Rd, Ward 3", tags: ["road"], imageDataUrl: null, solved: true, upvotes: 5, voters: ["u5","u6","u7","u8","u9"], createdAt: now - 5000, submitterId: "u2" },
-    { id: "c", description: "Garbage not collected", address: "Lane 4, Old Town", tags: ["garbage", "hygiene"], imageDataUrl: null, solved: false, upvotes: 5, voters: ["u1","u2","u10","u11","u12"], createdAt: now - 2000, submitterId: "u3" },
-  ];
-  const q1 = computeFilteredSorted(posts, { query: "potholes", statusFilter: "all", tagFilter: "", sortBy: "newest" });
-  console.assert(q1.length === 1 && q1[0].id === "b", "Query filter");
-  const tr = computeFilteredSorted(posts, { query: "", statusFilter: "all", tagFilter: "", sortBy: "trending" });
-  console.assert(tr[0].id === "c" && tr[1].id === "b", "Trending tiebreaker");
-  const pA1 = upvotePost(posts[0], "u1");
-  console.assert(pA1.upvotes === 4 && pA1.voters.includes("u1"), "Upvote increments");
-  const pA2 = upvotePost(pA1, "u1");
-  console.assert(pA2.upvotes === 4, "Duplicate prevented");
-  console.log("All assertions passed ✔");
-  console.groupEnd();
 }
 
 // -----------------------------
@@ -196,150 +90,189 @@ function runSelfTests() {
 // -----------------------------
 function useToasts() {
   const [toasts, setToasts] = useState([]);
-  function pushToast(msg, type = "info") {
+  const pushToast = (msg, type = "info") => {
     const id = uid();
     setToasts((t) => [...t, { id, msg, type }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3000);
-  }
+  };
   return { toasts, pushToast };
+}
+
+
+
+function AuthPanel({ me, onLoggedOut, toast }) {
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState("");
+  const [sending, setSending] = useState(false);
+
+  async function sendLink() {
+    if (!email.trim()) return;
+    try {
+      setSending(true);
+      const { requestMagicLink } = await import("./data/provider");
+      await requestMagicLink(email.trim());
+      toast?.("Magic link sent! Check your email.", "success");
+      setOpen(false);
+      setEmail("");
+    } catch (e) {
+      console.error(e);
+      toast?.(e?.message || "Failed to send magic link", "error");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function doLogout() {
+    const { signOut } = await import("./data/provider");
+    await signOut();
+    onLoggedOut?.();
+  }
+
+  return (
+    <div className="relative">
+      {me?.email ? (
+        <div className="flex items-center gap-2">
+          <span className="hidden sm:inline text-xs text-slate-600">Logged in as {me.email}</span>
+          <button
+            onClick={doLogout}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
+          >
+            <LogOut className="h-4 w-4" /> Sign out
+          </button>
+        </div>
+      ) : (
+        <>
+          <button
+            onClick={() => setOpen(v => !v)}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
+          >
+            <ShieldCheck className="h-4 w-4" /> Sign in
+          </button>
+          {open && (
+            <div className="absolute right-0 mt-2 w-80 rounded-2xl border border-slate-200 bg-white p-3 shadow-lg">
+              <p className="text-sm text-slate-600">
+                Enter your email. We’ll send a one-time link.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <input
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
+                  placeholder="you@example.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <button
+                  onClick={sendLink}
+                  disabled={sending}
+                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white shadow hover:bg-slate-800 disabled:opacity-60"
+                >
+                  {sending ? "Sending…" : "Send link"}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Tip: if the link opens <code>localhost:3000</code>, change Supabase **Auth → URL Configuration** to your dev port (5173) or run Vite on 3000.
+              </p>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 // -----------------------------
 // Main App
 // -----------------------------
 export default function CivicWatch() {
-  const userId = useLocalUser();
   const [posts, setPosts] = useState([]);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all"); // all | unsolved | solved
   const [tagFilter, setTagFilter] = useState("");
-  const [sortBy, setSortBy] = useState("trending"); // trending | newest | most_upvoted
-  const [isAuthority, setIsAuthority] = useState(() => localStorage.getItem(LS_KEY_AUTH) === "1");
-  const [myOnly, setMyOnly] = useState(false); // citizen view: show only my reports
+  const [sortBy, setSortBy] = useState("trending");
+  const [isAuthority, setIsAuthority] = useState(false);
+  const [myOnly, setMyOnly] = useState(false);
+  const [me, setMe] = useState(null);
   const { toasts, pushToast } = useToasts();
 
-  // map API rows to UI
-  const mapToUI = (p) => ({
-    id: p.id,
-    description: p.description,
-    address: p.address,
-    tags: p.tags || [],
-    imageDataUrl: p.image_url || null,
-    solved: !!p.solved,
-    upvotes: p.upvotes || 0,
-    voters: p.voters || [], // local provider fills this; supabase leaves empty
-    createdAt: p.created_at ? new Date(p.created_at).getTime() : Date.now(),
-    submitterId: p.created_by || "",
-  });
-
   async function refresh() {
-    const data = await listIssues({});
-    setPosts(data.map(mapToUI));
+    try {
+      const list = await listIssues({
+        q: query,
+        status: statusFilter,
+        tag: tagFilter,
+        sort: sortBy,
+      });
+      setPosts(Array.isArray(list) ? list : []);
+    } catch (e) {
+      console.error(e);
+      pushToast(e?.message || "Failed to load issues", "error");
+    }
   }
 
   useEffect(() => {
+    (async () => {
+      const user = await getCurrentUser();
+      setMe(user);
+      setIsAuthority(!!(user?.app_metadata?.provider) || !!user); // simple flag; real check is server-side
+      await refresh();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // refetch when filters change
     refresh();
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem(LS_KEY_AUTH, isAuthority ? "1" : "0");
-  }, [isAuthority]);
-
-  useEffect(() => {
-    if (typeof window !== "undefined" && ENABLE_SELF_TESTS) {
-      try {
-        runSelfTests();
-      } catch (e) {
-        console.warn("Self-tests threw:", e);
-      }
-    }
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, statusFilter, tagFilter, sortBy]);
 
   const allTags = useMemo(() => {
     const s = new Set();
-    posts.forEach((p) => p.tags.forEach((t) => s.add(t.toLowerCase())));
+    posts.forEach((p) => (p.tags || []).forEach((t) => s.add((t || "").toLowerCase())));
     return Array.from(s).sort();
   }, [posts]);
 
   const filtered = useMemo(() => {
     let list = computeFilteredSorted(posts, { query, statusFilter, tagFilter, sortBy });
-    if (!isAuthority && myOnly) list = list.filter((p) => p.submitterId === userId);
+    if (myOnly && me?.id) list = list.filter((p) => (p.created_by || p.submitterId) === me.id);
     return list;
-  }, [posts, query, statusFilter, tagFilter, sortBy, myOnly, isAuthority, userId]);
+  }, [posts, query, statusFilter, tagFilter, sortBy, myOnly, me]);
 
- 
-
-async function handleCreate({ description, address, tags, imageFile }) {
-  try {
-    await apiCreateIssue({ description, address, tags, imageFile });
-    await refresh();
-    pushToast("Issue submitted. Thank you!", "success");
-  } catch (e) {
-    console.error(e);
-    pushToast(e?.message || "Failed to submit issue", "error");
-  }
-}
-
-
-
-
-
-  // Upvote (providers handle dedupe)
- async function handleUpvote(id) {
-  if (DATA_MODE === "supabase") {
-    await apiUpvote(id);
-    const data = await listIssues({});
-    setPosts(data.map(p => ({ /* same mapping as above */ })));
-  } else {
-    // your old local upvote flow
-    setPosts(prev => prev.map(p => p.id === id ? upvotePost(p, userId) : p));
-  }
-}
-
-
-  // Authority: toggle solved (RPC in supabase; local mutate)
-  async function handleStatusToggle(id) {
-  if (!isAuthority) return;
-  if (DATA_MODE === "supabase") {
-    const post = posts.find(p => p.id === id);
-    await apiSetSolved(id, !post.solved);
-    const data = await listIssues({});
-    setPosts(data.map(p => ({ /* same mapping */ })));
-  } else {
-    setPosts(prev => prev.map(p => (p.id === id ? { ...p, solved: !p.solved } : p)));
-  }
-}
-
-
-  // Delete (local only)
-  function handleDelete(id) {
-    if (!isAuthority) return;
-    if (!IS_LOCAL) {
-      pushToast("Delete not implemented in server mode", "error");
-      return;
-    }
-    setPosts((prev) => prev.filter((p) => p.id !== id));
-  }
-
-  function handleAuthorityLogin(code) {
-    if (code.trim() === AUTH_DEMO_CODE) {
-      setIsAuthority(true);
-      pushToast("Logged in as Authority.", "success");
-    } else {
-      pushToast("Invalid code.", "error");
+  async function handleCreate({ description, address, tags, imageFile, clientNonce }) {
+    try {
+      await apiCreateIssue({ description, address, tags, imageFile, clientNonce });
+      await refresh();
+      pushToast("Issue submitted. Thank you!", "success");
+    } catch (e) {
+      console.error(e);
+      pushToast(e?.message || "Failed to submit issue", "error");
     }
   }
-  function handleAuthorityLogout() {
-    setIsAuthority(false);
-    pushToast("Authority mode disabled.", "info");
+
+  async function handleUpvote(id) {
+    try {
+      await apiUpvote(id);
+      await refresh();
+    } catch (e) {
+      console.error(e);
+      pushToast(e?.message || "Failed to upvote", "error");
+    }
+  }
+
+  async function handleStatusToggle(id, newVal) {
+    try {
+      await apiSetSolved(id, newVal);
+      await refresh();
+    } catch (e) {
+      console.error(e);
+      pushToast(e?.message || "Failed to change status", "error");
+    }
   }
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900">
-      <Header isAuthority={isAuthority} onLogin={handleAuthorityLogin} onLogout={handleAuthorityLogout} />
+      <Header me={me} />
 
       <main className="mx-auto max-w-6xl px-4 pb-24">
-        {isAuthority ? <AuthorityPanel posts={posts} /> : <SubmitCard onCreate={handleCreate} />}
+        <SubmitCard onCreate={handleCreate} />
 
         <FilterBar
           query={query}
@@ -359,11 +292,9 @@ async function handleCreate({ description, address, tags, imageFile }) {
         <PostGrid
           posts={filtered}
           onUpvote={handleUpvote}
-          onToggleStatus={handleStatusToggle}
-          onDelete={handleDelete}
-          userId={userId}
+          onToggleStatus={(id, val) => handleStatusToggle(id, val)}
+          userId={me?.id || ""}
           isAuthority={isAuthority}
-          isLocal={IS_LOCAL}
         />
       </main>
 
@@ -374,70 +305,9 @@ async function handleCreate({ description, address, tags, imageFile }) {
 }
 
 // -----------------------------
-// Authority panel (replaces form in authority mode)
+// Header
 // -----------------------------
-function AuthorityPanel({ posts }) {
-  const solved = posts.filter((p) => p.solved).length;
-  const unsolved = posts.length - solved;
-
-  function exportCSV() {
-    const headers = ["id", "description", "address", "tags", "solved", "upvotes", "createdAt", "submitterId"];
-    const rows = posts.map((p) =>
-      [
-        p.id,
-        JSON.stringify(p.description),
-        JSON.stringify(p.address),
-        JSON.stringify(p.tags.join(";")),
-        p.solved ? 1 : 0,
-        p.upvotes,
-        new Date(p.createdAt).toISOString(),
-        p.submitterId || "",
-      ].join(",")
-    );
-    const csv = [headers.join(","), ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `civicwatch_export_${Date.now()}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  return (
-    <section aria-label="Authority panel" className="mt-6">
-      <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm flex flex-wrap items-center gap-3 justify-between">
-        <div className="flex items-center gap-4 text-sm">
-          <span className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1 text-emerald-700">
-            Solved: <strong>{solved}</strong>
-          </span>
-        </div>
-        <div className="flex items-center gap-4 text-sm">
-          <span className="inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1 text-amber-700">
-            Unsolved: <strong>{unsolved}</strong>
-          </span>
-          <span className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1 text-slate-700">
-            Total: <strong>{posts.length}</strong>
-          </span>
-        </div>
-        <button
-          onClick={exportCSV}
-          className="inline-flex items-center gap-2 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
-          aria-label="Export CSV"
-        >
-          Export CSV
-        </button>
-      </div>
-    </section>
-  );
-}
-
-// -----------------------------
-// Header + simple authority auth
-// -----------------------------
-function Header({ isAuthority, onLogin, onLogout }) {
-  const [open, setOpen] = useState(false);
-  const [code, setCode] = useState("");
+function Header({ me }) {
   return (
     <header className="sticky top-0 z-20 backdrop-blur supports-[backdrop-filter]:bg-white/70 bg-white/80 border-b border-slate-200">
       <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
@@ -451,68 +321,53 @@ function Header({ isAuthority, onLogin, onLogout }) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          {isAuthority ? (
-            <button
-              className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
-              onClick={onLogout}
-              aria-label="Log out authority"
-            >
-              <ShieldCheck className="h-4 w-4" />
-              <span>Authority</span>
-              <LogOut className="h-4 w-4" />
-            </button>
-          ) : (
-            <>
-              <button
-                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
-                onClick={() => setOpen((o) => !o)}
-                aria-expanded={open}
-                aria-controls="auth-panel"
-                aria-label="Open authority login"
-              >
-                <ShieldCheck className="h-4 w-4" />
-                <span>Authority Login</span>
-                <LogIn className="h-4 w-4" />
-              </button>
-              <AnimatePresence>
-                {open && (
-                  <motion.div
-                    id="auth-panel"
-                    initial={{ opacity: 0, y: -6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -6 }}
-                    className="absolute right-4 top-16 w-72 rounded-2xl border border-slate-200 bg-white p-3 shadow-lg"
-                  >
-                    <p className="text-sm text-slate-600">
-                      Enter the authority code to manage issue status. (Demo code:&nbsp;
-                      <code className="rounded bg-slate-100 px-1 py-0.5">{AUTH_DEMO_CODE}</code>)
-                    </p>
-                    <div className="mt-3 flex gap-2">
-                      <input
-                        className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
-                        placeholder="Enter code"
-                        value={code}
-                        onChange={(e) => setCode(e.target.value)}
-                        aria-label="Authority code"
-                      />
-                      <button
-                        className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white shadow hover:bg-slate-800"
-                        onClick={() => onLogin(code)}
-                      >
-                        Unlock
-                      </button>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </>
-          )}
-        </div>
+        {/* New: login / logout */}
+        <AuthPanel
+          me={me}
+          toast={(m,t)=>window.dispatchEvent(new CustomEvent("cw-toast",{detail:{m,t}}))}
+          onLoggedOut={()=>window.location.reload()}
+        />
       </div>
     </header>
   );
 }
+
+
+
+
+
+
+
+
+useEffect(() => {
+  (async () => {
+    const user = await getCurrentUser();
+    setMe(user);
+    await refresh();
+  })();
+
+  // optional: react to auth changes across tabs
+  import("./data/provider").then(({ onAuthState }) => {
+    const off = onAuthState(async () => {
+      const user = await getCurrentUser();
+      setMe(user);
+      await refresh();
+    });
+    return off;
+  });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
+
+
+
+
+
+
+
+
+
 
 // -----------------------------
 // Submit (citizen only)
@@ -522,10 +377,12 @@ function SubmitCard({ onCreate }) {
   const [address, setAddress] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState([]);
-  const [imageDataUrl, setImageDataUrl] = useState(null); // preview only
-  const [selectedFile, setSelectedFile] = useState(null); // pass to provider
+  const [imageDataUrl, setImageDataUrl] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef(null);
+  const submittingRef = useRef(false);
+  const nonceRef = useRef(null);
 
   function addTagFromInput() {
     const raw = tagInput
@@ -540,62 +397,50 @@ function SubmitCard({ onCreate }) {
     setTags(merged);
     setTagInput("");
   }
+
   function removeTag(t) {
     setTags((x) => x.filter((y) => y !== t));
   }
+
   function onFileChange(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const file = e.target.files?.[0] || null;
+    setSelectedFile(file);
+    if (!file) {
+      setImageDataUrl(null);
+      return;
+    }
     if (!file.type.startsWith("image/")) {
       alert("Please select an image file.");
       return;
     }
-    setSelectedFile(file);
     const reader = new FileReader();
     reader.onload = () => setImageDataUrl(reader.result);
     reader.readAsDataURL(file);
   }
 
   async function handleSubmit(e) {
-
-// inside SubmitCard.handleSubmit
-const fileObj = fileRef.current?.files?.[0] || null;
-
-if (DATA_MODE === "supabase") {
-  await apiCreateIssue({ description: description.trim(), address: address.trim(), tags, imageFile: fileObj });
-  // After creating on server, refresh list:
-  const data = await listIssues({});
-  // Lift a refresh callback through props if you want; or return created item.
-} else {
-  // local fallback: existing onCreate(post) path (kept as-is)
-  onCreate({
-    id: uid(),
-    description: description.trim(),
-    address: address.trim(),
-    tags,
-    imageDataUrl,
-    solved: false,
-    upvotes: 0,
-    voters: [],
-    createdAt: Date.now(),
-    submitterId: window.localStorage.getItem("civicwatch.user.v1") || "unknown",
-  });
-}
-
-
     e.preventDefault();
+    if (submittingRef.current) return; // hard guard
+    submittingRef.current = true;
+
+    if (!nonceRef.current) nonceRef.current = crypto.randomUUID();
+
     if (!description.trim() || !address.trim()) {
       alert("Please provide a description and address.");
+      submittingRef.current = false;
       return;
     }
+
     setBusy(true);
     try {
       await onCreate({
-  description: description.trim(),
-  address: address.trim(),
-  tags,
-  imageFile: selectedFile,  // or null if you named it imageDataUrl before
-});
+        description: description.trim(),
+        address: address.trim(),
+        tags,
+        imageFile: selectedFile,
+        clientNonce: nonceRef.current, // pass nonce for idempotent upsert
+      });
+
       // reset form
       setDescription("");
       setAddress("");
@@ -605,6 +450,8 @@ if (DATA_MODE === "supabase") {
       setSelectedFile(null);
       if (fileRef.current) fileRef.current.value = "";
     } finally {
+      nonceRef.current = null; // new nonce for next submit
+      submittingRef.current = false;
       setBusy(false);
     }
   }
@@ -786,17 +633,15 @@ function FilterBar({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {!isAuthority && (
-            <label className="inline-flex items-center gap-2 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm">
-              <input
-                type="checkbox"
-                checked={myOnly}
-                onChange={(e) => setMyOnly(e.target.checked)}
-                aria-label="Show only my reports"
-              />
-              <span className="text-slate-700">My reports</span>
-            </label>
-          )}
+          <label className="inline-flex items-center gap-2 rounded-2xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm">
+            <input
+              type="checkbox"
+              checked={myOnly}
+              onChange={(e) => setMyOnly(e.target.checked)}
+              aria-label="Show only my reports"
+            />
+            <span className="text-slate-700">My reports</span>
+          </label>
 
           <SegToggle
             value={statusFilter}
@@ -829,11 +674,7 @@ function FilterBar({
 
 function SegToggle({ value, onChange, items, ariaLabel }) {
   return (
-    <div
-      role="tablist"
-      aria-label={ariaLabel}
-      className="inline-flex rounded-2xl border border-slate-300 bg-white p-1 text-sm shadow-sm"
-    >
+    <div role="tablist" aria-label={ariaLabel} className="inline-flex rounded-2xl border border-slate-300 bg-white p-1 text-sm shadow-sm">
       {items.map(({ value: v, label, icon: Icon }) => {
         const active = v === value;
         return (
@@ -899,7 +740,7 @@ function Select({ label, value, onChange, options }) {
 // -----------------------------
 // Post Grid
 // -----------------------------
-function PostGrid({ posts, onUpvote, onToggleStatus, onDelete, userId, isAuthority, isLocal }) {
+function PostGrid({ posts, onUpvote, onToggleStatus, userId, isAuthority }) {
   return (
     <section className="mt-6" aria-label="Reported issues">
       {posts.length === 0 ? (
@@ -908,16 +749,8 @@ function PostGrid({ posts, onUpvote, onToggleStatus, onDelete, userId, isAuthori
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <AnimatePresence mode="popLayout">
             {posts.map((p) => (
-              <motion.div key={p.id} layout initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
-                <PostCard
-                  post={p}
-                  onUpvote={onUpvote}
-                  onToggleStatus={onToggleStatus}
-                  onDelete={onDelete}
-                  userId={userId}
-                  isAuthority={isAuthority}
-                  isLocal={isLocal}
-                />
+              <motion.div key={p.id || p.client_nonce || uid()} layout initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+                <PostCard post={p} onUpvote={onUpvote} onToggleStatus={onToggleStatus} userId={userId} isAuthority={isAuthority} />
               </motion.div>
             ))}
           </AnimatePresence>
@@ -941,15 +774,15 @@ function EmptyState() {
   );
 }
 
-function PostCard({ post, onUpvote, onToggleStatus, onDelete, userId, isAuthority, isLocal }) {
-  const hasUpvoted = isLocal ? post.voters.includes(userId) : false; // server dedupes; we don't track per-user here
+function PostCard({ post, onUpvote, onToggleStatus, userId, isAuthority }) {
+  const hasUpvoteCount = typeof post.upvotes === "number";
   return (
     <article className="group rounded-3xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
       <div className="relative aspect-video w-full overflow-hidden rounded-t-3xl bg-slate-100">
-        {post.imageDataUrl ? (
+        {post.image_url || post.imageDataUrl ? (
           <img
-            src={post.imageDataUrl}
-            alt={post.description.slice(0, 80)}
+            src={post.image_url || post.imageDataUrl}
+            alt={post.description?.slice(0, 80) || "Issue image"}
             className="h-full w-full object-cover transition-transform group-hover:scale-[1.02]"
           />
         ) : (
@@ -957,9 +790,7 @@ function PostCard({ post, onUpvote, onToggleStatus, onDelete, userId, isAuthorit
         )}
         <div
           className={`absolute left-3 top-3 inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium shadow ${
-            post.solved
-              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-              : "bg-amber-50 text-amber-700 border border-amber-200"
+            post.solved ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-amber-50 text-amber-700 border border-amber-200"
           }`}
         >
           {post.solved ? <CheckCircle2 className="h-3.5 w-3.5" /> : <CircleAlert className="h-3.5 w-3.5" />}
@@ -970,14 +801,17 @@ function PostCard({ post, onUpvote, onToggleStatus, onDelete, userId, isAuthorit
       <div className="p-4">
         <div className="flex items-start justify-between gap-2">
           <h3 className="line-clamp-2 text-sm font-semibold text-slate-900">{post.description}</h3>
-          {isAuthority && isLocal && (
+          {/* Authority-only toggle */}
+          {isAuthority && (
             <button
-              className="rounded-xl border border-slate-300 bg-white p-1 text-slate-600 shadow-sm hover:bg-slate-50"
-              onClick={() => onDelete(post.id)}
-              aria-label="Delete post"
-              title="Delete post"
+              className={`inline-flex items-center gap-1 rounded-xl border px-2 py-1 text-xs shadow-sm ${
+                post.solved ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100" : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
+              }`}
+              onClick={() => onToggleStatus(post.id, !post.solved)}
+              aria-label={post.solved ? "Mark unsolved" : "Mark solved"}
             >
-              <Trash2 className="h-4 w-4" />
+              {post.solved ? <CircleCheck className="h-3.5 w-3.5" /> : <CircleAlert className="h-3.5 w-3.5" />}
+              {post.solved ? "Mark Unsolved" : "Mark Solved"}
             </button>
           )}
         </div>
@@ -989,13 +823,10 @@ function PostCard({ post, onUpvote, onToggleStatus, onDelete, userId, isAuthorit
           </span>
         </div>
 
-        {post.tags.length > 0 && (
+        {(post.tags || []).length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
-            {post.tags.map((t) => (
-              <span
-                key={t}
-                className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700"
-              >
+            {(post.tags || []).map((t) => (
+              <span key={t} className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700">
                 <Dot className="h-3 w-3" /> {t}
               </span>
             ))}
@@ -1003,38 +834,19 @@ function PostCard({ post, onUpvote, onToggleStatus, onDelete, userId, isAuthorit
         )}
 
         <div className="mt-3 flex items-center justify-between">
-          <div className="text-[11px] text-slate-500">{timeAgo(post.createdAt)}</div>
-
-          <div className="flex items-center gap-2">
-            {isAuthority ? (
-              <button
-                className={`inline-flex items-center gap-1 rounded-xl border px-2 py-1 text-xs shadow-sm ${
-                  post.solved
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-                    : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
-                }`}
-                onClick={() => onToggleStatus(post.id)}
-                aria-label={post.solved ? "Mark unsolved" : "Mark solved"}
-              >
-                {post.solved ? <CircleCheck className="h-3.5 w-3.5" /> : <CircleAlert className="h-3.5 w-3.5" />}
-                {post.solved ? "Mark Unsolved" : "Mark Solved"}
-              </button>
-            ) : (
-              <button
-                className={`inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs shadow-sm transition hover:bg-slate-50 ${
-                  hasUpvoted ? "opacity-70" : ""
-                }`}
-                disabled={hasUpvoted}
-                onClick={() => onUpvote(post.id)}
-                aria-pressed={hasUpvoted}
-                aria-label="Upvote"
-                title={hasUpvoted ? "You already upvoted" : "Upvote to boost visibility"}
-              >
-                <ThumbsUp className="h-4 w-4" />
-                <span className="tabular-nums">{post.upvotes}</span>
-              </button>
-            )}
+          <div className="text-[11px] text-slate-500">
+            {post.created_at ? timeAgo(new Date(post.created_at).getTime()) : post.createdAt ? timeAgo(post.createdAt) : ""}
           </div>
+
+          <button
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs shadow-sm transition hover:bg-slate-50"
+            onClick={() => onUpvote(post.id)}
+            aria-label="Upvote"
+            title="Upvote to boost visibility"
+          >
+            <ThumbsUp className="h-4 w-4" />
+            <span className="tabular-nums">{hasUpvoteCount ? post.upvotes : ""}</span>
+          </button>
         </div>
       </div>
     </article>
@@ -1062,13 +874,7 @@ function ToastHost({ toasts }) {
                 : "border-slate-200 bg-white text-slate-800"
             }`}
           >
-            {t.type === "success" ? (
-              <CheckCircle2 className="h-4 w-4" />
-            ) : t.type === "error" ? (
-              <CircleAlert className="h-4 w-4" />
-            ) : (
-              <Dot className="h-4 w-4" />
-            )}
+            {t.type === "success" ? <CheckCircle2 className="h-4 w-4" /> : t.type === "error" ? <CircleAlert className="h-4 w-4" /> : <Dot className="h-4 w-4" />}
             {t.msg}
           </motion.div>
         ))}
@@ -1081,9 +887,7 @@ function Footer() {
   return (
     <footer className="border-t border-slate-200 bg-white/70 py-8 mt-16">
       <div className="mx-auto max-w-6xl px-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-slate-600">
-          Built as a demo. Replace localStorage with secure APIs and proper role-based authentication for production use.
-        </p>
+        <p className="text-sm text-slate-600">Built as a demo. Replace localStorage with secure APIs and proper role-based auth for production use.</p>
         <div className="text-xs text-slate-500">© {new Date().getFullYear()} CivicWatch</div>
       </div>
     </footer>

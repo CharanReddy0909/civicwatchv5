@@ -50,17 +50,13 @@ export async function listIssues(params = {}) {
   });
 }
 
-export async function createIssue({ description, address, tags = [], imageFile }) {
+export async function createIssue({ description, address, tags = [], imageFile, clientNonce }) {
   if (!sb) throw new Error("Supabase not configured");
 
-  // Require login so RLS passes
-  const { data: { user }, error: uErr } = await sb.auth.getUser();
-  if (uErr) throw uErr;
+  const { data: { user } } = await sb.auth.getUser();
   if (!user) throw new Error("Sign-in required");
 
   let image_url = null;
-
-  // Best-effort image upload: warn but DON'T block the DB insert
   if (imageFile instanceof File) {
     try {
       const ext = (imageFile.name?.split(".").pop() || "jpg").toLowerCase();
@@ -69,21 +65,44 @@ export async function createIssue({ description, address, tags = [], imageFile }
       if (up.error) throw up.error;
       image_url = sb.storage.from("issues").getPublicUrl(up.data.path).data.publicUrl;
     } catch (e) {
-      console.warn("[CivicWatch] Image upload failed; inserting row without image:", e?.message || e);
-      // continue with image_url = null
+      console.warn("[CivicWatch] Image upload failed; inserting without image:", e?.message || e);
     }
   }
 
-  // Insert row (explicitly set created_by to satisfy policy)
-  const { data, error } = await sb
+  const payload = {
+    description,
+    address,
+    tags,
+    image_url,
+    created_by: user.id,
+    client_nonce: clientNonce,           // <-- IMPORTANT
+  };
+
+  // Upsert against the UNIQUE CONSTRAINT on client_nonce
+  // Note: with ignoreDuplicates=true, PostgREST returns [] (no row) on duplicate.
+  const upsert = await sb
     .from("issues")
-    .insert({ description, address, tags, image_url, created_by: user.id })
+    .upsert(payload, { onConflict: "client_nonce", ignoreDuplicates: true })
+    .select("*");
+
+  if (upsert.error) throw upsert.error;
+
+  if (upsert.data && upsert.data.length > 0) {
+    // Freshly inserted row
+    return upsert.data[0];
+  }
+
+  // It was a duplicate (same nonce). Fetch the existing row once.
+  const existing = await sb
+    .from("issues")
     .select("*")
+    .eq("client_nonce", clientNonce)
     .single();
 
-  if (error) throw error;
-  return data;
+  if (existing.error) throw existing.error;
+  return existing.data;
 }
+
 
 
 
@@ -102,6 +121,33 @@ export async function setIssueSolved(issueId, solved) {
   if (error) throw error;
   return data;
 }
+
+// ADD these exports near the bottom of src/data/providers/supabase.js
+
+// Start email magic-link sign-in. Opens user's email; they click link → back to your site.
+export async function requestMagicLink(email) {
+  if (!sb) throw new Error("Supabase not configured");
+  const redirectTo = window.location.origin; // works local & prod
+  const { data, error } = await sb.auth.signInWithOtp({
+    email,
+    options: { emailRedirectTo: redirectTo }
+  });
+  if (error) throw error;
+  return data;
+}
+
+export async function signOut() {
+  if (!sb) return;
+  await sb.auth.signOut();
+}
+
+// OPTIONAL: keep UI in sync if session changes in another tab
+export function onAuthState(cb) {
+  if (!sb) return () => {};
+  const { data: sub } = sb.auth.onAuthStateChange((_e, _session) => cb?.());
+  return () => sub?.subscription?.unsubscribe();
+}
+
 
 export async function signIn() { /* optional */ }
 export async function signOut() { /* optional */ }
