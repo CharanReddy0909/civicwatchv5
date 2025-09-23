@@ -1,10 +1,10 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
+
 import {
   createIssue as apiCreateIssue,
   setIssueSolved as apiSetSolved,
   upvoteIssue as apiUpvote,
-  getCurrentUser,
   listIssues
 } from "./data/provider";
 
@@ -16,22 +16,21 @@ import {
   CircleDot,
   Dot,
   Filter,
+  LogOut,
   MapPin,
   Plus,
   Search,
+  ShieldCheck,
   Tag,
   ThumbsUp,
-  Upload
+  Upload,
 } from "lucide-react";
 
-
-
-
 /**
- * NOTE: This App.jsx is updated to prevent **duplicate submissions**.
- * - The form is guarded against double-submit (ref + busy).
- * - We pass a clientNonce to the provider, which upserts by a UNIQUE constraint.
- * - We do NOT optimistically add to state; we insert via provider then refresh().
+ * NOTE: Prevents duplicate submissions by:
+ * - guarding the form (busy + submittingRef)
+ * - passing a clientNonce to the provider (DB upsert on UNIQUE constraint)
+ * - reloading from API after insert (no optimistic local add)
  */
 
 // -----------------------------
@@ -76,9 +75,15 @@ function computeFilteredSorted(posts, { query, statusFilter, tagFilter, sortBy }
     list = list.filter((p) => (p.tags || []).map((t) => t.toLowerCase()).includes(tf));
   }
   if (sortBy === "trending") {
-    list = [...list].sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0) || (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0));
+    list = [...list].sort(
+      (a, b) =>
+        (b.upvotes || 0) - (a.upvotes || 0) ||
+        (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0)
+    );
   } else if (sortBy === "newest") {
-    list = [...list].sort((a, b) => (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0));
+    list = [...list].sort(
+      (a, b) => (b.created_at || b.createdAt || 0) - (a.created_at || a.createdAt || 0)
+    );
   } else if (sortBy === "most_upvoted") {
     list = [...list].sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0));
   }
@@ -98,41 +103,110 @@ function useToasts() {
   return { toasts, pushToast };
 }
 
-
-
+// -----------------------------
+// Auth panel
+// -----------------------------
 function AuthPanel({ me, onLoggedOut, toast }) {
   const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState("signin"); // 'signin' | 'signup'
   const [email, setEmail] = useState("");
-  const [sending, setSending] = useState(false);
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [username, setUsername] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  async function sendLink() {
-    if (!email.trim()) return;
+  async function handleSignin() {
     try {
-      setSending(true);
-      const { requestMagicLink } = await import("./data/provider");
-      await requestMagicLink(email.trim());
-      toast?.("Magic link sent! Check your email.", "success");
+      setBusy(true);
+      const { signInWithPassword } = await import("./data/provider");
+      await signInWithPassword({ email: email.trim(), password });
+      toast?.("Signed in!", "success");
       setOpen(false);
-      setEmail("");
     } catch (e) {
-      console.error(e);
-      toast?.(e?.message || "Failed to send magic link", "error");
+      toast?.(e?.message || "Sign in failed", "error");
     } finally {
-      setSending(false);
+      setBusy(false);
     }
   }
 
-  async function doLogout() {
-    const { signOut } = await import("./data/provider");
-    await signOut();
-    onLoggedOut?.();
+  async function handleSignup() {
+    if (!username.trim()) return toast?.("Please enter a username", "error");
+    if (password.length < 6) return toast?.("Password must be at least 6 characters", "error");
+    if (password !== confirm) return toast?.("Passwords do not match", "error");
+    try {
+      setBusy(true);
+      const { signUpWithPassword } = await import("./data/provider");
+      await signUpWithPassword({ email: email.trim(), password, username: username.trim() });
+      toast?.("Account created! You are now signed in.", "success");
+      setOpen(false);
+    } catch (e) {
+      toast?.(e?.message || "Sign up failed", "error");
+    } finally {
+      setBusy(false);
+    }
   }
+
+ 
+
+
+
+// async function doLogout() {
+//   try {
+//     const { signOut, getCurrentUser } = await import("./data/provider");
+//     await signOut();
+
+//     // Clean any auth params/hash from the URL
+//     if (window.location.hash || window.location.search) {
+//       window.history.replaceState({}, "", window.location.pathname);
+//     }
+
+//     // Force-check current user and update UI
+//     const u = await getCurrentUser();
+//     if (u) {
+//       // Fallback: hard reload if session still appears (rare)
+//       window.location.reload();
+//     } else {
+//       onLoggedOut?.(); // e.g., your onLoggedOut calls window.location.reload() or setMe(null)
+//     }
+//   } catch (e) {
+//     toast?.(e?.message || "Sign out failed", "error");
+//   }
+// }
+
+
+
+
+
+async function doLogout() {
+  try {
+    const { signOut } = await import("./data/provider");
+    await signOut();                  // clears session
+    setOpen(false);                   // close the menu
+    // optional: clean hash/query without a full reload
+    if (window.location.hash || window.location.search) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    // No manual reload needed — the onAuthState listener will set me=null
+    toast?.("Signed out", "success");
+  } catch (e) {
+    toast?.(e?.message || "Sign out failed", "error");
+  }
+}
+
+
+
+
+
+
+
 
   return (
     <div className="relative">
       {me?.email ? (
         <div className="flex items-center gap-2">
-          <span className="hidden sm:inline text-xs text-slate-600">Logged in as {me.email}</span>
+          <span className="hidden sm:inline text-xs text-slate-600">
+            {me.profile?.username ? `${me.profile.username} · ` : ""}{me.email}
+          </span>
           <button
             onClick={doLogout}
             className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
@@ -146,31 +220,98 @@ function AuthPanel({ me, onLoggedOut, toast }) {
             onClick={() => setOpen(v => !v)}
             className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
           >
-            <ShieldCheck className="h-4 w-4" /> Sign in
+            <ShieldCheck className="h-4 w-4" /> Sign in / up
           </button>
+
           {open && (
-            <div className="absolute right-0 mt-2 w-80 rounded-2xl border border-slate-200 bg-white p-3 shadow-lg">
-              <p className="text-sm text-slate-600">
-                Enter your email. We’ll send a one-time link.
-              </p>
-              <div className="mt-3 flex gap-2">
+            <div className="absolute right-0 mt-2 w-[22rem] rounded-2xl border border-slate-200 bg-white p-4 shadow-lg">
+              <div className="mb-3 flex gap-2 text-sm">
+                <button
+                  className={`rounded-lg px-3 py-1 ${mode === "signin" ? "bg-slate-900 text-white" : "bg-slate-100"}`}
+                  onClick={() => setMode("signin")}
+                >
+                  Sign in
+                </button>
+                <button
+                  className={`rounded-lg px-3 py-1 ${mode === "signup" ? "bg-slate-900 text-white" : "bg-slate-100"}`}
+                  onClick={() => setMode("signup")}
+                >
+                  Sign up
+                </button>
+              </div>
+
+              {mode === "signup" && (
+                <div className="mb-2">
+                  <label className="block text-xs text-slate-600">Username</label>
+                  <input
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
+                    placeholder="yourname"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                  />
+                </div>
+              )}
+
+              <div className="mb-2">
+                <label className="block text-xs text-slate-600">Email</label>
                 <input
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
+                  type="email"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
                   placeholder="you@example.com"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                 />
-                <button
-                  onClick={sendLink}
-                  disabled={sending}
-                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white shadow hover:bg-slate-800 disabled:opacity-60"
-                >
-                  {sending ? "Sending…" : "Send link"}
-                </button>
               </div>
-              <p className="mt-2 text-xs text-slate-500">
-                Tip: if the link opens <code>localhost:3000</code>, change Supabase **Auth → URL Configuration** to your dev port (5173) or run Vite on 3000.
-              </p>
+
+              <div className="mb-2">
+                <label className="block text-xs text-slate-600">Password</label>
+                <input
+                  type="password"
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </div>
+
+              {mode === "signup" && (
+                <div className="mb-3">
+                  <label className="block text-xs text-slate-600">Confirm Password</label>
+                  <input
+                    type="password"
+                    className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-400"
+                    placeholder="••••••••"
+                    value={confirm}
+                    onChange={(e) => setConfirm(e.target.value)}
+                  />
+                </div>
+              )}
+
+              <div className="mt-3 flex justify-end gap-2">
+                <button
+                  onClick={() => setOpen(false)}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                {mode === "signin" ? (
+                  <button
+                    onClick={handleSignin}
+                    disabled={busy}
+                    className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white shadow hover:bg-slate-800 disabled:opacity-60"
+                  >
+                    {busy ? "Signing in…" : "Sign in"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleSignup}
+                    disabled={busy}
+                    className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white shadow hover:bg-slate-800 disabled:opacity-60"
+                  >
+                    {busy ? "Creating…" : "Create account"}
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </>
@@ -179,13 +320,14 @@ function AuthPanel({ me, onLoggedOut, toast }) {
   );
 }
 
+
 // -----------------------------
 // Main App
 // -----------------------------
 export default function CivicWatch() {
   const [posts, setPosts] = useState([]);
   const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all"); // all | unsolved | solved
+  const [statusFilter, setStatusFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("");
   const [sortBy, setSortBy] = useState("trending");
   const [isAuthority, setIsAuthority] = useState(false);
@@ -208,21 +350,57 @@ export default function CivicWatch() {
     }
   }
 
-  useEffect(() => {
-    (async () => {
-      const user = await getCurrentUser();
-      setMe(user);
-      setIsAuthority(!!(user?.app_metadata?.provider) || !!user); // simple flag; real check is server-side
-      await refresh();
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
-  useEffect(() => {
-    // refetch when filters change
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, statusFilter, tagFilter, sortBy]);
+
+// useEffect(() => {
+//   let off = () => {};
+//   (async () => {
+//     const { onAuthState, getCurrentUser } = await import("./data/provider");
+//     off = onAuthState(async () => {
+//       const u = await getCurrentUser();
+//       setMe(u || null);
+//       // Optional: also refresh the list after sign-in/out
+//       await refresh();
+//     });
+//   })();
+//   return () => off();
+// }, []);
+
+
+
+
+
+
+useEffect(() => {
+  let off = () => {};
+  (async () => {
+    const { getCurrentUser, onAuthState } = await import("./data/provider");
+
+    const u = await getCurrentUser();
+    setMe(u || null);
+    await refresh();
+
+    off = onAuthState(async () => {
+      const u2 = await getCurrentUser();
+      setMe(u2 || null);
+      await refresh();
+    });
+  })();
+
+  return () => off();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
+
+
+
+
+
+
+
+
+ 
 
   const allTags = useMemo(() => {
     const s = new Set();
@@ -269,7 +447,7 @@ export default function CivicWatch() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900">
-      <Header me={me} />
+      <Header me={me} toast={pushToast} />
 
       <main className="mx-auto max-w-6xl px-4 pb-24">
         <SubmitCard onCreate={handleCreate} />
@@ -307,7 +485,7 @@ export default function CivicWatch() {
 // -----------------------------
 // Header
 // -----------------------------
-function Header({ me }) {
+function Header({ me, toast }) {
   return (
     <header className="sticky top-0 z-20 backdrop-blur supports-[backdrop-filter]:bg-white/70 bg-white/80 border-b border-slate-200">
       <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
@@ -321,53 +499,15 @@ function Header({ me }) {
           </div>
         </div>
 
-        {/* New: login / logout */}
         <AuthPanel
           me={me}
-          toast={(m,t)=>window.dispatchEvent(new CustomEvent("cw-toast",{detail:{m,t}}))}
-          onLoggedOut={()=>window.location.reload()}
+          toast={toast}
+          onLoggedOut={() => window.location.reload()}
         />
       </div>
     </header>
   );
 }
-
-
-
-
-
-
-
-
-useEffect(() => {
-  (async () => {
-    const user = await getCurrentUser();
-    setMe(user);
-    await refresh();
-  })();
-
-  // optional: react to auth changes across tabs
-  import("./data/provider").then(({ onAuthState }) => {
-    const off = onAuthState(async () => {
-      const user = await getCurrentUser();
-      setMe(user);
-      await refresh();
-    });
-    return off;
-  });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-
-
-
-
-
-
-
-
-
-
 
 // -----------------------------
 // Submit (citizen only)
@@ -438,7 +578,7 @@ function SubmitCard({ onCreate }) {
         address: address.trim(),
         tags,
         imageFile: selectedFile,
-        clientNonce: nonceRef.current, // pass nonce for idempotent upsert
+        clientNonce: nonceRef.current,
       });
 
       // reset form
@@ -566,9 +706,7 @@ function SubmitCard({ onCreate }) {
                     {imageDataUrl ? (
                       <img src={imageDataUrl} alt="Uploaded preview" className="h-full w-full object-cover" />
                     ) : (
-                      <div className="flex h-full w-full items-center justify-center text-xs text-slate-500">
-                        No image selected
-                      </div>
+                      <div className="flex h-full w-full items-center justify-center text-xs text-slate-500">No image selected</div>
                     )}
                   </div>
                 </div>
@@ -749,8 +887,20 @@ function PostGrid({ posts, onUpvote, onToggleStatus, userId, isAuthority }) {
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <AnimatePresence mode="popLayout">
             {posts.map((p) => (
-              <motion.div key={p.id || p.client_nonce || uid()} layout initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
-                <PostCard post={p} onUpvote={onUpvote} onToggleStatus={onToggleStatus} userId={userId} isAuthority={isAuthority} />
+              <motion.div
+                key={p.id || p.client_nonce || uid()}
+                layout
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+              >
+                <PostCard
+                  post={p}
+                  onUpvote={onUpvote}
+                  onToggleStatus={onToggleStatus}
+                  userId={userId}
+                  isAuthority={isAuthority}
+                />
               </motion.div>
             ))}
           </AnimatePresence>
@@ -790,7 +940,9 @@ function PostCard({ post, onUpvote, onToggleStatus, userId, isAuthority }) {
         )}
         <div
           className={`absolute left-3 top-3 inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium shadow ${
-            post.solved ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-amber-50 text-amber-700 border border-amber-200"
+            post.solved
+              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+              : "bg-amber-50 text-amber-700 border border-amber-200"
           }`}
         >
           {post.solved ? <CheckCircle2 className="h-3.5 w-3.5" /> : <CircleAlert className="h-3.5 w-3.5" />}
@@ -801,11 +953,12 @@ function PostCard({ post, onUpvote, onToggleStatus, userId, isAuthority }) {
       <div className="p-4">
         <div className="flex items-start justify-between gap-2">
           <h3 className="line-clamp-2 text-sm font-semibold text-slate-900">{post.description}</h3>
-          {/* Authority-only toggle */}
           {isAuthority && (
             <button
               className={`inline-flex items-center gap-1 rounded-xl border px-2 py-1 text-xs shadow-sm ${
-                post.solved ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100" : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                post.solved
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                  : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
               }`}
               onClick={() => onToggleStatus(post.id, !post.solved)}
               aria-label={post.solved ? "Mark unsolved" : "Mark solved"}
@@ -826,7 +979,10 @@ function PostCard({ post, onUpvote, onToggleStatus, userId, isAuthority }) {
         {(post.tags || []).length > 0 && (
           <div className="mt-2 flex flex-wrap gap-2">
             {(post.tags || []).map((t) => (
-              <span key={t} className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700">
+              <span
+                key={t}
+                className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700"
+              >
                 <Dot className="h-3 w-3" /> {t}
               </span>
             ))}
@@ -835,7 +991,11 @@ function PostCard({ post, onUpvote, onToggleStatus, userId, isAuthority }) {
 
         <div className="mt-3 flex items-center justify-between">
           <div className="text-[11px] text-slate-500">
-            {post.created_at ? timeAgo(new Date(post.created_at).getTime()) : post.createdAt ? timeAgo(post.createdAt) : ""}
+            {post.created_at
+              ? timeAgo(new Date(post.created_at).getTime())
+              : post.createdAt
+              ? timeAgo(post.createdAt)
+              : ""}
           </div>
 
           <button
@@ -874,7 +1034,13 @@ function ToastHost({ toasts }) {
                 : "border-slate-200 bg-white text-slate-800"
             }`}
           >
-            {t.type === "success" ? <CheckCircle2 className="h-4 w-4" /> : t.type === "error" ? <CircleAlert className="h-4 w-4" /> : <Dot className="h-4 w-4" />}
+            {t.type === "success" ? (
+              <CheckCircle2 className="h-4 w-4" />
+            ) : t.type === "error" ? (
+              <CircleAlert className="h-4 w-4" />
+            ) : (
+              <Dot className="h-4 w-4" />
+            )}
             {t.msg}
           </motion.div>
         ))}
@@ -887,7 +1053,9 @@ function Footer() {
   return (
     <footer className="border-t border-slate-200 bg-white/70 py-8 mt-16">
       <div className="mx-auto max-w-6xl px-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-slate-600">Built as a demo. Replace localStorage with secure APIs and proper role-based auth for production use.</p>
+        <p className="text-sm text-slate-600">
+          Built as a demo. Replace localStorage with secure APIs and proper role-based auth for production use.
+        </p>
         <div className="text-xs text-slate-500">© {new Date().getFullYear()} CivicWatch</div>
       </div>
     </footer>

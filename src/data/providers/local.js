@@ -1,73 +1,47 @@
-const LS_KEY = "civicwatch.posts.v1";
+// src/data/providers/local.js
+// Very simple local-only fallback. No real auth.
 
-const load = () => JSON.parse(localStorage.getItem(LS_KEY) || "[]");
-const save = (arr) => localStorage.setItem(LS_KEY, JSON.stringify(arr));
+let _issues = [];
 
-export async function getCurrentUser() { return { id: localStorage.getItem("civicwatch.user.v1") || "anon" }; }
-export async function signIn()  { return getCurrentUser(); }
-export async function signOut() { return true; }
+export async function getCurrentUser() {
+  // Simulate anonymous user
+  return { id: "local-user", email: null, profile: { username: "local" } };
+}
+
+export function onAuthState() {
+  return () => {};
+}
 
 export async function listIssues() {
-  // Adapt local keys to API-ish shape
-  return load().map(p => ({
-    id: p.id,
-    description: p.description,
-    address: p.address,
-    tags: p.tags || [],
-    image_url: p.imageDataUrl || null,
-    solved: !!p.solved,
-    upvotes: p.upvotes || 0,
-    created_by: p.submitterId || "anon",
-    created_at: new Date(p.createdAt || Date.now()).toISOString(),
-    updated_at: new Date(p.createdAt || Date.now()).toISOString(),
-    voters: p.voters || [],
-  }));
+  return _issues.slice().sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0));
 }
 
-export async function createIssue({ description, address, tags = [], imageFile }) {
-  const all = load();
-  const now = Date.now();
-  const id  = Math.random().toString(36).slice(2);
-  let imageDataUrl = null;
-
-  if (imageFile && imageFile instanceof File) {
-    imageDataUrl = await new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload = () => res(r.result);
-      r.onerror = rej;
-      r.readAsDataURL(imageFile);
-    });
-  }
-  const submitterId = localStorage.getItem("civicwatch.user.v1") || "anon";
-  const post = {
-    id, description, address, tags, imageDataUrl,
-    solved: false, upvotes: 0, voters: [],
-    createdAt: now, submitterId
+export async function createIssue({ description, address, tags = [], imageFile, clientNonce }) {
+  const rec = {
+    id: crypto.randomUUID(),
+    description, address, tags,
+    image_url: null,
+    created_at: new Date().toISOString(),
+    upvotes: 0,
+    solved: false,
+    client_nonce: clientNonce,
   };
-  all.unshift(post);
-  save(all);
-  return { ...post, image_url: imageDataUrl, created_by: submitterId, created_at: new Date(now).toISOString() };
+  _issues.push(rec);
+  return rec;
 }
 
-export async function upvoteIssue(issueId, userId) {
-  const all = load();
-  const i = all.findIndex(p => p.id === issueId);
-  if (i < 0) throw new Error("Not found");
-  const p = all[i];
-  p.voters = p.voters || [];
-  if (!p.voters.includes(userId)) {
-    p.voters.push(userId);
-    p.upvotes = (p.upvotes || 0) + 1;
-  }
-  save(all);
+export async function upvoteIssue(issueId) {
+  const it = _issues.find(i => i.id === issueId);
+  if (it) it.upvotes = (it.upvotes || 0) + 1;
   return { ok: true };
 }
 
 export async function setIssueSolved(issueId, solved) {
-  const all = load();
-  const i = all.findIndex(p => p.id === issueId);
-  if (i < 0) throw new Error("Not found");
-  all[i].solved = !!solved;
-  save(all);
-  return { ok: true };
+  const it = _issues.find(i => i.id === issueId);
+  if (it) it.solved = !!solved;
+  return it;
+}
+
+export async function signOut() {
+  // nothing in local mode
 }
