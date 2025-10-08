@@ -1054,7 +1054,7 @@ function Footer() {
     <footer className="border-t border-slate-200 bg-white/70 py-8 mt-16">
       <div className="mx-auto max-w-6xl px-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-slate-600">
-          Built as a demo. Replace localStorage with secure APIs and proper role-based auth for production use.
+          Built by Charan Reddy
         </p>
         <div className="text-xs text-slate-500">© {new Date().getFullYear()} CivicWatch</div>
       </div>
